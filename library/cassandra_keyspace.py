@@ -4,30 +4,39 @@
 
 DOCUMENTATION = '''
 ---
-module: cassandra_role
+module: cassandra_keyspace
 
-short_description: Manage Cassandra Roles
+short_description: Manage Cassandra Keyspaces
 description:
-    - Add/remove Cassandra Users
+    - Add/remove Cassandra Keyspaces
     - requires `pip install cassandra-driver`
     - Related Docs: https://datastax.github.io/python-driver/api/cassandra/query.html
-    - Related Docs: https://docs.datastax.com/en/cql/3.3/cql/cql_reference/create_role.html
-author: "Sam Adams"
+    - Related Docs: https://docs.datastax.com/en/archived/cql/3.3/cql/cql_reference/cqlCreateKeyspace.html
+author: "Sergey Kazenniy"
 options:
   name:
     description:
-      - name of the role to add or remove
+      - name of the keyspace to add or remove
     required: true
     alias: role
-  password:
+  topology:
     description:
-      - Set the role's password. Setting password will always elicit a 'change' (even if is the same).
+      - Set the keyspace's replication strategy class
+    choices: [ "SimpleStrategy", "NetworkTopologyStrategy" ]
     required: true
-  superuser:
+  datacenter:
     description:
-      - Create the user as a superuser?
+      - Set datacenter name for NetworkTopologyStrategy
     required: false
-    default: False
+   replication_factor:
+    description:
+      - Set Replication strategy factor
+    required: false
+    default: 1
+  durable_writes:
+    description:
+      - Disable write commit log for the cycling keyspace
+    default: true
   login_hosts:
     description:
       - List of hosts to login to Cassandra with
@@ -58,10 +67,10 @@ notes:
 '''
 
 EXAMPLES = '''
-# Create Role
-- cassandra_role: name='foo' password='12345' state=present superuser=False login_hosts=localhost login_pass=cassandra login_user=cassandra
+# Create Keyspace
+- cassandra_role: name='foo' topology='simple' state=present replication_factor=1 login_hosts=localhost login_pass=cassandra login_user=cassandra
 
-# Remove Role
+# Remove Keyspace
 - cassandra_role: name='foo' state=absent login_hosts=localhost login_pass=cassandra login_user=cassandra
 '''
 
@@ -74,65 +83,42 @@ except ImportError:
 else:
     cassandra_dep_found = True
 
-GET_ROLE = 'SELECT * FROM system_auth.roles WHERE role = %s limit 1;'
-DROP_ROLE = 'DROP ROLE %s'
-ALTER_ROLE_WITH_PASS = 'ALTER ROLE %s WITH PASSWORD = %s AND LOGIN = %s AND SUPERUSER = %s'
-CREATE_ROLE_WITH_PASS = 'CREATE ROLE %s WITH PASSWORD = %s AND LOGIN = %s AND SUPERUSER = %s'
-CREATE_ROLE_NO_PASS = 'CREATE ROLE %s WITH LOGIN = %s AND SUPERUSER = %s'
-ALTER_ROLE_NO_PASS = 'ALTER ROLE %s WITH LOGIN = %s AND SUPERUSER = %s'
+GET_KEYSPACE = "SELECT * FROM system_schema.keyspaces WHERE keyspace_name = %s limit 1;"
+DROP_KEYSPACE = "DROP KEYSPACE %s"
 
 
-def role_delete(session, in_check_mode, name):
-    existing_role = get_role(session, name)
-    if bool(existing_role):
+def keyspace_delete(session, in_check_mode, name):
+    existing_keyspace = get_keyspace(session, name)
+    if bool(existing_keyspace):
         if not in_check_mode:
-            session.execute(DROP_ROLE, [name])
+            session.execute(DROP_KEYSPACE, [name])
         return True
     else:
         return False
 
 
-def get_role(session, name):
-    rows = session.execute(GET_ROLE, [name])
+def get_keyspace(session, name):
+    rows = session.execute(GET_KEYSPACE, [name])
     for row in rows:
         return row
 
 
-def role_save(session, check_mode, name, password, can_login, is_superuser):
-    existing_role = get_role(session, name)
-    if check_mode:
-        return would_change(existing_role, can_login, is_superuser, password)
-
-    do_save(session, existing_role, is_superuser, name, password, can_login)
-
-    new_user = get_role(session, name)
-    return bool(new_user != existing_role)
-
-
-def do_save(session, existing_role, is_superuser, name, password, can_login):
-    existing_role = bool(existing_role)
-
-    if bool(password):
-        params = (name, password, can_login, is_superuser)
-        if existing_role:
-            query = ALTER_ROLE_WITH_PASS
-        else:
-            query = CREATE_ROLE_WITH_PASS
+def keyspace_create(session, check_mode, name, topology, datacenter, replication_factor, durable_writes):
+    existing_keyspace = get_keyspace(session, name)
+    if bool(existing_keyspace):
+        if check_mode:
+            return False
     else:
-        params = (name, can_login, is_superuser)
-        if existing_role:
-            query = ALTER_ROLE_NO_PASS
+        if check_mode:
+            return True
+        if topology == 'SimpleStrategy':
+            query = "CREATE KEYSPACE %s WITH REPLICATION = { 'class' : '%s', 'replication_factor' : '%s' } AND DURABLE_WRITES = %s;"
+            session.execute(query % (name, topology, replication_factor, durable_writes))
         else:
-            query = CREATE_ROLE_NO_PASS
-    session.execute(query, params)
-
-
-def would_change(existing_role, can_login, is_superuser, password):
-    if password or not existing_role:
-        # even setting existing password updates the `salted_hash` in the db, so no way to check has changed.
-        return True
-    else:
-        return bool(existing_role['can_login'] != can_login or existing_role['is_superuser'] != is_superuser)
+            query = "CREATE KEYSPACE %s WITH REPLICATION = { 'class' : '%s', '%s' : '%s' } AND DURABLE_WRITES = %s;"
+            session.execute(query % (name, topology, datacenter, replication_factor, durable_writes))
+    new_keyspace = get_keyspace(session, name)
+    return bool(new_keyspace != existing_keyspace)
 
 
 def main():
@@ -157,18 +143,22 @@ def main():
             },
             'name': {
                 'required': True,
-                'aliases': ['role']
+                'aliases': ['keyspace']
             },
-            'password': {
-                'default': None,
-                'no_log': True
+            'topology': {
+                'required': True,
+                'choices': [ "SimpleStrategy", "NetworkTopologyStrategy" ]
             },
-            'enable_login': {
-                'default': False,
-                'type': 'bool'
+            'datacenter': {
+                'default': 'datacenter1',
+                'type': 'str'
             },
-            'superuser': {
-                'default': False,
+            'replication_factor': {
+                'default': 1,
+                'type': 'int'
+            },
+            'durable_writes': {
+                'default': True,
                 'type': 'bool'
             },
             'state': {
@@ -182,10 +172,11 @@ def main():
     login_password = module.params["login_password"]
     login_hosts = module.params["login_hosts"]
     login_port = module.params["login_port"]
-    enable_login = module.params["enable_login"]
+    topology = module.params["topology"]
+    datacenter = module.params["datacenter"]
     name = module.params["name"]
-    password = module.params["password"]
-    superuser = module.params["superuser"]
+    replication_factor = module.params["replication_factor"]
+    durable_writes = module.params["durable_writes"]
     state = module.params["state"]
 
     if not cassandra_dep_found:
@@ -209,12 +200,12 @@ def main():
 
     if state == "present":
         try:
-            changed = role_save(session, module.check_mode, name, password, enable_login, superuser)
+            changed = keyspace_create(session, module.check_mode, name, topology, datacenter, replication_factor, durable_writes)
         except Exception as e:
             module.fail_json(msg=str(e))
     elif state == "absent":
         try:
-            changed = role_delete(session, module.check_mode, name)
+            changed = keyspace_delete(session, module.check_mode, name)
         except Exception as e:
             module.fail_json(msg=str(e))
     module.exit_json(changed=changed, name=name)
